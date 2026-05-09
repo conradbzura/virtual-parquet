@@ -1,0 +1,44 @@
+[package]
+name = "virtual-parquet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Scaffolding for serving non-Parquet data sources to mainstream Parquet-consuming engines via a stable adapter contract."
+repository = "https://github.com/conradbzura/virtual-parquet"
+readme = "README.md"
+keywords = ["parquet", "arrow", "adapter", "streaming"]
+categories = ["database", "encoding"]
+
+[lib]
+name = "virtual_parquet"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enabled by maturin when building the Python wheel; off by default so that
+# `cargo check` and `cargo test` can link against libpython normally.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+parquet = { version = "54", default-features = false }
+arrow = { version = "54", default-features = false, features = ["pyarrow"] }
+arrow-array = "54"
+arrow-schema = "54"
+arrow-buffer = "54"
+pyo3 = { version = "0.23", features = ["abi3-py310"] }
+thiserror = "2"
+thrift = "0.17"
+
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
