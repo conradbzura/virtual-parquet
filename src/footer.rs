@@ -23,6 +23,25 @@ pub(crate) const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet thrift `FileMetaData.version`. v1 emits the v1 (DataPageV1) format only.
 const PARQUET_FORMAT_VERSION: i32 = 1;
 
+/// Minimum size of the serialized footer thrift, in bytes.
+///
+/// Parquet readers like PyArrow speculatively read the last 64 KiB of the file
+/// to capture the footer in one I/O call. If the actual footer is smaller, the
+/// speculative read also pulls bytes from the trailing column chunks, which on
+/// a virtual_parquet file forces the byte server to encode (and the adapter to
+/// fetch) data the reader is going to discard. Padding the footer to at least
+/// the readers' typical probe size keeps that probe inside footer territory.
+///
+/// 64 KiB matches PyArrow's default. DuckDB's parquet reader probes a similar
+/// size; bumping the floor to 128 KiB gives headroom without meaningfully
+/// growing the file.
+const FOOTER_PADDING_TARGET: usize = 128 * 1024;
+
+/// Key for the synthetic padding entry in `key_value_metadata`. Readers that
+/// don't recognize this key ignore it (per Parquet spec); the value is opaque
+/// `\0` bytes whose only purpose is to grow the footer.
+const FOOTER_PADDING_KEY: &str = "virtual-parquet:footer-padding";
+
 /// Internal metadata for one finalized column chunk, ready to be referenced from the
 /// footer. Computed by `reader.rs` during the metadata pre-pass.
 #[derive(Debug, Clone)]
@@ -256,7 +275,7 @@ pub(crate) fn build_file_metadata(
     // `Statistics.min_value` / `max_value` fields (per Parquet spec). One entry
     // per column, in schema order; v1 uses the standard type-defined ordering.
     let column_orders = vec![ColumnOrder::TYPEORDER(TypeDefinedOrder {}); schema.len()];
-    Ok(FileMetaData {
+    let mut metadata = FileMetaData {
         version: PARQUET_FORMAT_VERSION,
         schema: schema_elements,
         num_rows: total_rows,
@@ -269,7 +288,45 @@ pub(crate) fn build_file_metadata(
         column_orders: Some(column_orders),
         encryption_algorithm: None,
         footer_signing_key_metadata: None,
-    })
+    };
+    pad_footer_to_target(&mut metadata, FOOTER_PADDING_TARGET)?;
+    Ok(metadata)
+}
+
+/// Pad `metadata.key_value_metadata` so the serialized footer reaches `target`
+/// bytes. Iteratively re-serializes (typically converges in 1-2 passes) because
+/// adding bytes to a Thrift compact value also grows the length prefixes. No-op
+/// when the footer is already large enough.
+fn pad_footer_to_target(metadata: &mut FileMetaData, target: usize) -> Result<(), Error> {
+    let mut current = serialize_thrift(metadata)?.len();
+    if current >= target {
+        return Ok(());
+    }
+    // Drop any prior padding entry so re-serialization is idempotent under
+    // repeated calls.
+    if let Some(kv_list) = metadata.key_value_metadata.as_mut() {
+        kv_list.retain(|kv| kv.key != FOOTER_PADDING_KEY);
+    }
+    // Initial guess: enough value bytes to close the gap, plus headroom for
+    // the new KV envelope (key + length-prefix overhead).
+    let mut value_len = target - current + 64;
+    loop {
+        let value = "\0".repeat(value_len);
+        let entry = KeyValue {
+            key: FOOTER_PADDING_KEY.to_string(),
+            value: Some(value),
+        };
+        let kv_list = metadata.key_value_metadata.get_or_insert_with(Vec::new);
+        kv_list.retain(|kv| kv.key != FOOTER_PADDING_KEY);
+        kv_list.push(entry);
+        current = serialize_thrift(metadata)?.len();
+        if current >= target {
+            return Ok(());
+        }
+        // Under-shot — Thrift compact's varint length prefix grew. Add the gap
+        // plus another small headroom and try again.
+        value_len += target - current + 16;
+    }
 }
 
 /// Build a `DataPageV1` page header for the given column-chunk page parameters.
