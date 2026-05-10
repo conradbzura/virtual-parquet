@@ -1,13 +1,16 @@
-"""Drive a chr22 self-intersection on a remote BAM through DuckDB.
+"""Drive a chr22 self-intersection on a whole-genome remote BAM through DuckDB.
 
 End-to-end flow:
-  remote BAM (HTTPS) -> oxbow (range-reads via fsspec) -> BamAdapter
-  -> virtual_parquet -> fsspec adapter -> DuckDB (read_parquet on a vp:// URL).
+  remote BAM (HTTPS) -> BAI parsed at construction (row groups planned from
+  the index alone, no BAM data read) -> oxbow lazy-fetches one chromosome's
+  worth of reads only when DuckDB pulls bytes from that row group ->
+  virtual_parquet emits Parquet bytes on demand -> fsspec adapter -> DuckDB.
 
 The query is a self-intersection on read intervals with a 500 bp slop window,
 shaped as the inequality predicates that DuckDB optimizes via its IE_JOIN
-operator. Per-row-group min/max stats on (chrom, pos, end) let DuckDB skip
-row groups that don't contain chr22 reads.
+operator. Per-row-group chrom-only stats let DuckDB skip every row group that
+doesn't contain chr22 reads, so only one chromosome's BAM bytes ever flow
+through the pipeline.
 
 Requires: oxbow, duckdb, fsspec[http], pyarrow installed alongside virtual_parquet.
 """
@@ -36,23 +39,23 @@ BAM_URL = (
     "01_ESC/align/rep1/4DNFIVWIBHN4.trim.srt.nodup.no_chrM_MT.bam"
 )
 BAI_URL = BAM_URL + ".bai"
-REGIONS = ("chr21", "chr22")  # small chroms; multi-chrom file proves stat pruning
 VFS_PATH = "atac.parquet"
 
 SLOP = 500
 
+# Self-exclusion is by ordering on (pos, end) rather than qname, so the schema
+# can stay (chrom, pos, end) — the adapter never has to read a variable-width
+# data column to size it, which keeps the BAI-only manifest mode honest.
 QUERY = f"""
-SELECT a.qname AS a_qname,
-       b.qname AS b_qname,
-       a.pos   AS a_pos,
-       a.end   AS a_end,
-       b.pos   AS b_pos,
-       b.end   AS b_end
+SELECT a.pos AS a_pos,
+       a.end AS a_end,
+       b.pos AS b_pos,
+       b.end AS b_end
 FROM   (SELECT * FROM atac WHERE chrom = 'chr22') a
 JOIN   (SELECT * FROM atac WHERE chrom = 'chr22') b
   ON   a.pos - {SLOP} < b.end
   AND  a.end + {SLOP} > b.pos
-  AND  a.qname <> b.qname
+  AND  (a.pos < b.pos OR (a.pos = b.pos AND a.end < b.end))
 """
 
 
@@ -160,22 +163,19 @@ def _format_int(n: int) -> str:
 
 
 def main() -> None:
-    print(f"Streaming BAM via oxbow: {Path(BAM_URL).name}", flush=True)
-    print(f"  regions: {list(REGIONS)}")
+    print(f"Indexing BAM via BAI alone (no BAM data read yet): {Path(BAM_URL).name}", flush=True)
     t = time.time()
-    adapter = BamAdapter(BAM_URL, index_url=BAI_URL, regions=REGIONS)
-    total_rows = sum(b.num_rows for b in adapter._batches)
+    adapter = BamAdapter(BAM_URL, index_url=BAI_URL)
+    total_rows = sum(rows for _, rows in adapter._row_groups)
     print(
-        f"  {adapter.row_group_count} row groups, {_format_int(total_rows)} reads "
-        f"in {time.time() - t:.2f}s"
+        f"  {adapter.row_group_count} row groups planned from BAI metadata, "
+        f"{_format_int(total_rows)} reads total — in {time.time() - t:.2f}s"
     )
 
-    print("\nPer-row-group ranges:")
-    for i, s in enumerate(adapter._stats):
-        print(
-            f"  rg {i:2d}: chrom [{s['chrom_min']!r}..{s['chrom_max']!r}]  "
-            f"pos [{s['pos_min']:>11,}..{s['pos_max']:>11,}]"
-        )
+    print("\nFirst / last 5 row-group declarations (rows from BAI; pos/end stats declined):")
+    rgs = list(enumerate(adapter._row_groups))
+    for i, (chrom, rows) in rgs[:5] + rgs[-5:]:
+        print(f"  rg {i:>3d}: chrom={chrom!r:>30s}  rows={_format_int(rows):>12s}")
 
     with vp.open(adapter) as vpf:
         size = vpf.size()
