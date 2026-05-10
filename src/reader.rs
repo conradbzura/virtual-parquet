@@ -610,6 +610,27 @@ fn read_column_chunks_segment(
     adapter: &dyn Adapter,
 ) -> Result<i64, Error> {
     let (rg_idx, col_idx, local_offset) = locate_column_chunk(pos, layout)?;
+    let layout_col = &layout.row_groups[rg_idx as usize].columns[col_idx];
+
+    // Fast path: serve the page-header prefix directly from the layout
+    // without invoking the adapter or encoding the row group's data. The
+    // page header bytes are computed in closed form during the metadata
+    // pre-pass and stored in `layout_col.page_header_bytes`. Engines like
+    // PyArrow probe the first few hundred bytes of every column chunk at
+    // file open to validate structure / build a scan plan; without this
+    // shortcut every probe triggers a full row-group fetch + encode.
+    //
+    // If the request straddles the header/data boundary we serve only
+    // up to the header end in this segment and let `read_range` re-enter
+    // for the data portion (which falls through to `ensure_chunk`).
+    let header_len = layout_col.page_header_bytes.len();
+    if local_offset < header_len {
+        let header_remaining = header_len - local_offset;
+        let take = header_remaining.min((end - pos) as usize);
+        out.extend_from_slice(&layout_col.page_header_bytes[local_offset..local_offset + take]);
+        return Ok(take as i64);
+    }
+
     let chunk_bytes = ensure_chunk(rg_idx, col_idx, layout, cache, adapter)?;
     let chunk_remaining = chunk_bytes.len() - local_offset;
     let take = chunk_remaining.min((end - pos) as usize);
