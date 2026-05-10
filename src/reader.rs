@@ -30,12 +30,20 @@ use crate::footer::{
     ComputedColumnChunk, ComputedRowGroup, PARQUET_MAGIC,
 };
 
-const TRAILER_SIZE: i64 = 8; // 4 bytes footer length + 4 bytes PAR1 magic
+/// Length of the leading and trailing PAR1 magic.
+const MAGIC_SIZE: i64 = 4;
+/// Length of the i32-LE footer-length suffix between the footer thrift and the trailing magic.
+const FOOTER_LEN_SIZE: i64 = 4;
+/// Trailing 4-byte footer length + 4-byte PAR1 magic that close out the file.
+const TRAILER_SIZE: i64 = FOOTER_LEN_SIZE + MAGIC_SIZE;
+
+const POISON_MSG: &str = "byte-server lock poisoned";
 
 /// Layout of a single column chunk within the virtual file.
 #[derive(Debug, Clone)]
 struct ColumnChunkLayout {
     column_type: ColumnType,
+    nullable: bool,
     file_offset: i64,
     page_header_bytes: Vec<u8>,
     def_levels_size: i64,
@@ -108,7 +116,7 @@ impl ByteServer {
     /// Total size of the virtual file. Lazily triggers the metadata pre-pass on first call.
     pub(crate) fn total_size(&self) -> Result<i64, Error> {
         self.ensure_serving()?;
-        let state = self.state.lock().expect("byte-server lock poisoned");
+        let state = self.state.lock().expect(POISON_MSG);
         match &*state {
             State::Serving { layout, .. } => Ok(layout.total_size),
             State::Closed => Err(Error::InvalidState("byte-server is closed".into())),
@@ -144,20 +152,20 @@ impl ByteServer {
 
     /// Close the byte-server: drop layout/cache, reject subsequent operations.
     pub(crate) fn close(&self) {
-        let mut state = self.state.lock().expect("byte-server lock poisoned");
+        let mut state = self.state.lock().expect(POISON_MSG);
         *state = State::Closed;
         self.cv.notify_all();
     }
 
     /// True iff the byte-server has been closed.
     pub(crate) fn is_closed(&self) -> bool {
-        let state = self.state.lock().expect("byte-server lock poisoned");
+        let state = self.state.lock().expect(POISON_MSG);
         matches!(&*state, State::Closed)
     }
 
     /// Run the metadata pre-pass (idempotent, single-flight) and transition to `Serving`.
     fn ensure_serving(&self) -> Result<(), Error> {
-        let mut state = self.state.lock().expect("byte-server lock poisoned");
+        let mut state = self.state.lock().expect(POISON_MSG);
         loop {
             match &*state {
                 State::Serving { .. } => return Ok(()),
@@ -166,17 +174,14 @@ impl ByteServer {
                 }
                 State::MetadataPass => {
                     // Another thread is doing the pre-pass; wait for it.
-                    state = self
-                        .cv
-                        .wait(state)
-                        .expect("byte-server lock poisoned during cv.wait");
+                    state = self.cv.wait(state).expect(POISON_MSG);
                 }
                 State::Created => {
                     // We win the race: claim the pre-pass slot.
                     *state = State::MetadataPass;
                     drop(state);
                     let outcome = self.compute_layout();
-                    let mut state = self.state.lock().expect("byte-server lock poisoned");
+                    let mut state = self.state.lock().expect(POISON_MSG);
                     match (&*state, outcome) {
                         // Closed in the meantime — just propagate.
                         (State::Closed, _) => {
@@ -229,7 +234,8 @@ impl ByteServer {
         }
 
         // Second pass: assign file offsets and serialize page headers using running offsets.
-        let mut cursor: i64 = 4; // leading PAR1 magic occupies bytes 0..4
+        // Skip the leading PAR1 magic; column chunks begin immediately after.
+        let mut cursor: i64 = MAGIC_SIZE;
         let mut chunk_index: Vec<(i64, u32, usize)> = Vec::new();
         for (rg_idx, rg) in row_groups.iter_mut().enumerate() {
             for (col_idx, col) in rg.columns.iter_mut().enumerate() {
@@ -260,6 +266,7 @@ impl ByteServer {
                 // observed value.
                 chunks.push(ComputedColumnChunk {
                     physical_type: col_layout.column_type,
+                    nullable: col_layout.nullable,
                     file_offset: col_layout.file_offset,
                     total_size: col_layout.total_size(),
                     num_values: rg_layout.num_rows,
@@ -299,19 +306,19 @@ impl ByteServer {
 
     /// Read whatever single contiguous segment lies at `pos`, up to `end`. Append to `out`.
     fn read_segment(&self, out: &mut Vec<u8>, pos: i64, end: i64) -> Result<i64, Error> {
-        let mut state = self.state.lock().expect("byte-server lock poisoned");
+        let mut state = self.state.lock().expect(POISON_MSG);
         let State::Serving { layout, cache } = &mut *state else {
             return Err(Error::InvalidState("byte-server is not serving".into()));
         };
 
-        // [0, 4): leading magic
-        if pos < 4 {
-            let take = ((4 - pos) as usize).min((end - pos) as usize);
+        // [0, MAGIC_SIZE): leading magic
+        if pos < MAGIC_SIZE {
+            let take = ((MAGIC_SIZE - pos) as usize).min((end - pos) as usize);
             out.extend_from_slice(&PARQUET_MAGIC[pos as usize..pos as usize + take]);
             return Ok(take as i64);
         }
 
-        // [4, footer_offset): column chunks
+        // [MAGIC_SIZE, footer_offset): column chunks
         if pos < layout.footer_offset {
             return read_column_chunks_segment(out, pos, end, layout, cache, self.adapter.as_ref());
         }
@@ -326,8 +333,8 @@ impl ByteServer {
             return Ok(take as i64);
         }
 
-        // [footer_end, footer_end + 4): footer length (i32 LE)
-        if pos < footer_end + 4 {
+        // [footer_end, footer_end + FOOTER_LEN_SIZE): footer length (i32 LE)
+        if pos < footer_end + FOOTER_LEN_SIZE {
             let local = (pos - footer_end) as usize;
             let footer_len = i32::try_from(layout.footer_bytes.len()).map_err(|_| {
                 Error::Encoding(format!(
@@ -336,15 +343,15 @@ impl ByteServer {
                 ))
             })?;
             let bytes = footer_len.to_le_bytes();
-            let take = (4 - local).min((end - pos) as usize);
+            let take = ((FOOTER_LEN_SIZE as usize) - local).min((end - pos) as usize);
             out.extend_from_slice(&bytes[local..local + take]);
             return Ok(take as i64);
         }
 
-        // [total - 4, total): trailing magic
+        // [total - MAGIC_SIZE, total): trailing magic
         if pos < layout.total_size {
-            let local = (pos - (footer_end + 4)) as usize;
-            let take = (4 - local).min((end - pos) as usize);
+            let local = (pos - (footer_end + FOOTER_LEN_SIZE)) as usize;
+            let take = ((MAGIC_SIZE as usize) - local).min((end - pos) as usize);
             out.extend_from_slice(&PARQUET_MAGIC[local..local + take]);
             return Ok(take as i64);
         }
@@ -418,11 +425,28 @@ fn validate_batch(schema: &Schema, plan: &RowGroupPlan, batch: &RecordBatch) -> 
                 field.data_type()
             )));
         }
-        if !col.nullable && field.is_nullable() && batch.column(i).null_count() > 0 {
+        let observed_nulls = batch.column(i).null_count() as i64;
+        if !col.nullable && observed_nulls > 0 {
             return Err(Error::SchemaMismatch(format!(
-                "column {:?} is declared non-nullable but contains nulls",
+                "column {:?} is declared non-nullable but contains {observed_nulls} nulls",
                 col.name
             )));
+        }
+        // Cross-check declared null_count against observed when the adapter declared
+        // both. The footer is built from the declared value (FR-008 — never fabricate
+        // from observed data), and the layout's fixed-width values_size is sized
+        // from the declared value too. If they disagree, the encoder would later
+        // produce bytes whose total length diverges from the reserved layout slot —
+        // surfaced here at pre-pass time, before the footer is committed.
+        if let Some(stat) = plan.column_stats.get(i).and_then(Option::as_ref) {
+            if let Some(declared) = stat.null_count {
+                if declared != observed_nulls {
+                    return Err(Error::SchemaMismatch(format!(
+                        "column {:?}: declared null_count={declared} differs from observed {observed_nulls}",
+                        col.name
+                    )));
+                }
+            }
         }
     }
     Ok(())
@@ -554,6 +578,7 @@ fn build_column_chunk_layout(
 
     Ok(ColumnChunkLayout {
         column_type: col.data_type,
+        nullable: col.nullable,
         // file_offset is filled in during the second pass.
         file_offset: 0,
         page_header_bytes,
@@ -623,34 +648,14 @@ fn ensure_chunk<'a>(
     cache: &'a mut Option<RowGroupCache>,
     adapter: &dyn Adapter,
 ) -> Result<&'a [u8], Error> {
-    let rg_layout = &layout.row_groups[rg_idx as usize];
-
     let needs_install = !matches!(cache, Some(c) if c.index == rg_idx);
     if needs_install {
-        let batch = adapter.fetch(rg_idx)?.batch;
-        let plan = &layout.plans[rg_idx as usize];
-        validate_batch(&layout.schema, plan, &batch)?;
-
-        let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(rg_layout.columns.len());
-        for (i, col) in layout.schema.columns().iter().enumerate() {
-            let array = batch.column(i);
-            let layout_col = &rg_layout.columns[i];
-            let (def_block, value_bytes) = encode_column(col, array.as_ref())?;
-            let mut chunk_bytes = Vec::with_capacity(
-                layout_col.page_header_bytes.len() + def_block.len() + value_bytes.len(),
-            );
-            chunk_bytes.extend_from_slice(&layout_col.page_header_bytes);
-            chunk_bytes.extend_from_slice(&def_block);
-            chunk_bytes.extend_from_slice(&value_bytes);
-            if chunk_bytes.len() as i64 != layout_col.total_size() {
-                return Err(Error::Encoding(format!(
-                    "column chunk size mismatch at row_group {rg_idx} col {i}: encoded {} bytes, expected {}",
-                    chunk_bytes.len(),
-                    layout_col.total_size()
-                )));
-            }
-            chunks.push(chunk_bytes);
-        }
+        // Constitution Principle II / SC-003: at most one row group's encoded bytes
+        // may be resident at a time. Drop the previous row group's chunks BEFORE
+        // we fetch the next batch so the new RecordBatch + WIP encode buffers do
+        // not coexist with the old encoded bytes.
+        *cache = None;
+        let chunks = encode_row_group(rg_idx, layout, adapter)?;
         *cache = Some(RowGroupCache {
             index: rg_idx,
             column_chunks: chunks,
@@ -662,62 +667,81 @@ fn ensure_chunk<'a>(
         .column_chunks[col_idx])
 }
 
+/// Fetch and encode every column chunk for one row group, validating the batch
+/// against schema + declared statistics before returning.
+fn encode_row_group(
+    rg_idx: u32,
+    layout: &FileLayout,
+    adapter: &dyn Adapter,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let rg_layout = &layout.row_groups[rg_idx as usize];
+    let batch = adapter.fetch(rg_idx)?.batch;
+    let plan = &layout.plans[rg_idx as usize];
+    validate_batch(&layout.schema, plan, &batch)?;
+
+    let mut chunks: Vec<Vec<u8>> = Vec::with_capacity(rg_layout.columns.len());
+    for (i, col) in layout.schema.columns().iter().enumerate() {
+        let array = batch.column(i);
+        let layout_col = &rg_layout.columns[i];
+        let (def_block, value_bytes) = encode_column(col, array.as_ref())?;
+        let mut chunk_bytes = Vec::with_capacity(
+            layout_col.page_header_bytes.len() + def_block.len() + value_bytes.len(),
+        );
+        chunk_bytes.extend_from_slice(&layout_col.page_header_bytes);
+        chunk_bytes.extend_from_slice(&def_block);
+        chunk_bytes.extend_from_slice(&value_bytes);
+        if chunk_bytes.len() as i64 != layout_col.total_size() {
+            return Err(Error::Encoding(format!(
+                "column chunk size mismatch at row_group {rg_idx} col {i}: encoded {} bytes, expected {}",
+                chunk_bytes.len(),
+                layout_col.total_size()
+            )));
+        }
+        chunks.push(chunk_bytes);
+    }
+    Ok(chunks)
+}
+
 fn encode_column(col: &Column, array: &dyn Array) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    fn downcast<'a, T: 'static>(
+        array: &'a dyn Array,
+        col_name: &str,
+        expected: &str,
+    ) -> Result<&'a T, Error> {
+        array.as_any().downcast_ref::<T>().ok_or_else(|| {
+            Error::SchemaMismatch(format!("column {col_name:?}: expected {expected}"))
+        })
+    }
     match col.data_type {
-        ColumnType::Int32 => {
-            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
-                Error::SchemaMismatch(format!("column {:?}: expected Int32Array", col.name))
-            })?;
-            encode_int32_values(arr, col.nullable)
-        }
-        ColumnType::Int64 => {
-            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                Error::SchemaMismatch(format!("column {:?}: expected Int64Array", col.name))
-            })?;
-            encode_int64_values(arr, col.nullable)
-        }
-        ColumnType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| {
-                    Error::SchemaMismatch(format!("column {:?}: expected Float32Array", col.name))
-                })?;
-            encode_float32_values(arr, col.nullable)
-        }
-        ColumnType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| {
-                    Error::SchemaMismatch(format!("column {:?}: expected Float64Array", col.name))
-                })?;
-            encode_float64_values(arr, col.nullable)
-        }
-        ColumnType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    Error::SchemaMismatch(format!("column {:?}: expected BooleanArray", col.name))
-                })?;
-            encode_boolean_values(arr, col.nullable)
-        }
+        ColumnType::Int32 => encode_int32_values(
+            downcast::<Int32Array>(array, &col.name, "Int32Array")?,
+            col.nullable,
+        ),
+        ColumnType::Int64 => encode_int64_values(
+            downcast::<Int64Array>(array, &col.name, "Int64Array")?,
+            col.nullable,
+        ),
+        ColumnType::Float32 => encode_float32_values(
+            downcast::<Float32Array>(array, &col.name, "Float32Array")?,
+            col.nullable,
+        ),
+        ColumnType::Float64 => encode_float64_values(
+            downcast::<Float64Array>(array, &col.name, "Float64Array")?,
+            col.nullable,
+        ),
+        ColumnType::Boolean => encode_boolean_values(
+            downcast::<BooleanArray>(array, &col.name, "BooleanArray")?,
+            col.nullable,
+        ),
         ColumnType::String => match array.data_type() {
-            DataType::Utf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("Utf8 type must downcast to StringArray");
-                encode_string_values(arr, col.nullable)
-            }
-            DataType::LargeUtf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .expect("LargeUtf8 type must downcast to LargeStringArray");
-                encode_large_string_values(arr, col.nullable)
-            }
+            DataType::Utf8 => encode_string_values(
+                downcast::<StringArray>(array, &col.name, "StringArray (Utf8)")?,
+                col.nullable,
+            ),
+            DataType::LargeUtf8 => encode_large_string_values(
+                downcast::<LargeStringArray>(array, &col.name, "LargeStringArray (LargeUtf8)")?,
+                col.nullable,
+            ),
             other => Err(Error::SchemaMismatch(format!(
                 "column {:?}: expected Utf8 or LargeUtf8, got {other:?}",
                 col.name

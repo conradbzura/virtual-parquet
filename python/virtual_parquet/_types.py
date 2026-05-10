@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 
+def _reject_bool(value: object, label: str) -> None:
+    # bool is a subclass of int; accepting it silently turns True/False into 1/0
+    # for fields documented as integer counts.
+    if isinstance(value, bool):
+        raise TypeError(f"{label} must be an int, not a bool")
+
+
 class ColumnType(Enum):
     """Logical column types supported in v1.
 
@@ -38,10 +45,6 @@ class Column:
             raise ValueError("Column.name must be non-empty")
         if "." in self.name or "/" in self.name:
             raise ValueError(f"Column.name {self.name!r} must not contain '.' or '/'")
-        if not isinstance(self.type, ColumnType):
-            raise TypeError(
-                f"Column.type must be a ColumnType, got {type(self.type).__name__}"
-            )
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,11 @@ class Schema:
     columns: tuple[Column, ...]
 
     def __post_init__(self) -> None:
+        # Coerce list/iterable input to tuple to honor the frozen-hashability promise
+        # in the module docstring; passing a list would otherwise leave a mutable
+        # container in a "frozen" dataclass.
+        if not isinstance(self.columns, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
+            object.__setattr__(self, "columns", tuple(self.columns))
         if not self.columns:
             raise ValueError("Schema.columns must be non-empty")
         names = [c.name for c in self.columns]
@@ -72,8 +80,12 @@ class ColumnStatistics:
     null_count: int | None = None
 
     def __post_init__(self) -> None:
-        if self.null_count is not None and self.null_count < 0:
-            raise ValueError(f"ColumnStatistics.null_count must be >= 0, got {self.null_count}")
+        if self.null_count is not None:
+            _reject_bool(self.null_count, "ColumnStatistics.null_count")
+            if self.null_count < 0:
+                raise ValueError(
+                    f"ColumnStatistics.null_count must be >= 0, got {self.null_count}"
+                )
 
 
 @dataclass(frozen=True)
@@ -89,8 +101,12 @@ class RowGroupPlan:
     column_byte_sizes: tuple[int | None, ...] | None = None
 
     def __post_init__(self) -> None:
+        _reject_bool(self.rows, "RowGroupPlan.rows")
         if self.rows < 0:
             raise ValueError(f"RowGroupPlan.rows must be >= 0, got {self.rows}")
+        # Coerce iterables to tuple to preserve frozen-hashability.
+        if not isinstance(self.column_stats, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
+            object.__setattr__(self, "column_stats", tuple(self.column_stats))
         for i, stat in enumerate(self.column_stats):
             if stat is not None and stat.null_count is not None and stat.null_count > self.rows:
                 raise ValueError(
@@ -98,11 +114,19 @@ class RowGroupPlan:
                     f"exceeds rows={self.rows}"
                 )
         if self.column_byte_sizes is not None:
+            if not isinstance(self.column_byte_sizes, tuple):  # pyright: ignore[reportUnnecessaryIsInstance]
+                object.__setattr__(
+                    self, "column_byte_sizes", tuple(self.column_byte_sizes)
+                )
             if len(self.column_byte_sizes) != len(self.column_stats):
                 raise ValueError(
                     f"RowGroupPlan.column_byte_sizes length {len(self.column_byte_sizes)} "
                     f"must equal column_stats length {len(self.column_stats)}"
                 )
             for i, sz in enumerate(self.column_byte_sizes):
-                if sz is not None and sz < 0:
-                    raise ValueError(f"RowGroupPlan.column_byte_sizes[{i}] must be >= 0, got {sz}")
+                if sz is not None:
+                    _reject_bool(sz, f"RowGroupPlan.column_byte_sizes[{i}]")
+                    if sz < 0:
+                        raise ValueError(
+                            f"RowGroupPlan.column_byte_sizes[{i}] must be >= 0, got {sz}"
+                        )

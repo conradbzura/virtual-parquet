@@ -1,4 +1,4 @@
-//! Parquet footer (FileMetaData) construction and Thrift compact serialization.
+//! Parquet footer (`FileMetaData`) construction and Thrift compact serialization.
 //!
 //! This module owns the conversion from our internal `Schema` + computed row group
 //! metadata into the canonical `parquet::format::FileMetaData` Thrift struct, plus
@@ -7,8 +7,9 @@
 //! bytes are emitted on demand by `reader.rs`.
 
 use parquet::format::{
-    ColumnChunk, ColumnMetaData, CompressionCodec, DataPageHeader, Encoding, FieldRepetitionType,
-    FileMetaData, KeyValue, PageHeader, PageType, RowGroup, SchemaElement, Statistics, Type,
+    ColumnChunk, ColumnMetaData, ColumnOrder, CompressionCodec, DataPageHeader, Encoding,
+    FieldRepetitionType, FileMetaData, KeyValue, PageHeader, PageType, RowGroup, SchemaElement,
+    Statistics, Type, TypeDefinedOrder,
 };
 use parquet::thrift::TSerializable;
 use thrift::protocol::TCompactOutputProtocol;
@@ -19,11 +20,17 @@ use crate::error::Error;
 /// Magic bytes that bracket every Parquet file.
 pub(crate) const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 
+/// Parquet thrift `FileMetaData.version`. v1 emits the v1 (DataPageV1) format only.
+const PARQUET_FORMAT_VERSION: i32 = 1;
+
 /// Internal metadata for one finalized column chunk, ready to be referenced from the
 /// footer. Computed by `reader.rs` during the metadata pre-pass.
 #[derive(Debug, Clone)]
 pub(crate) struct ComputedColumnChunk {
     pub(crate) physical_type: ColumnType,
+    /// Whether the column is nullable; controls whether a definition-level block is
+    /// emitted and what encodings are advertised in the footer.
+    pub(crate) nullable: bool,
     /// Byte offset of the column chunk's first page header in the file.
     pub(crate) file_offset: i64,
     /// Total bytes the column chunk occupies (page header + def levels block + values block).
@@ -90,7 +97,7 @@ pub(crate) fn build_schema_elements(schema: &Schema) -> Result<Vec<SchemaElement
 
     let num_children = i32::try_from(schema.len()).map_err(|_| {
         Error::InvalidSchema(format!(
-            "schema has {} columns, exceeds i32::MAX",
+            "schema has {} columns, exceeds `i32::MAX`",
             schema.len()
         ))
     })?;
@@ -144,13 +151,17 @@ fn build_column_metadata(column_name: &str, chunk: &ComputedColumnChunk) -> Colu
     let any_declared =
         chunk.min_value.is_some() || chunk.max_value.is_some() || chunk.null_count.is_some();
     let statistics = if any_declared {
+        // Per Parquet spec, the legacy `min`/`max` Statistics fields use unsigned
+        // byte ordering, while the modern `min_value`/`max_value` use type-aware
+        // (signed) ordering. Emitting identical Plain-LE bytes for both would
+        // serialize the legacy fields incorrectly for signed numeric/float types
+        // with negative values. Modern writers (parquet-mr's
+        // `ParquetMetadataConverter`) populate only the typed pair; we follow that.
+        // PyArrow consumers read the modern values via
+        // `Statistics.min_raw` / `.max_raw`.
         Some(Statistics {
-            // parquet-cpp via PyArrow surfaces min/max via the legacy `min`/`max` fields
-            // when present; emit them alongside the typed `min_value`/`max_value` so both
-            // reader generations see the bounds. The byte form is identical for our v1
-            // physical types.
-            max: chunk.max_value.clone(),
-            min: chunk.min_value.clone(),
+            max: None,
+            min: None,
             null_count: chunk.null_count,
             distinct_count: None,
             max_value: chunk.max_value.clone(),
@@ -164,13 +175,22 @@ fn build_column_metadata(column_name: &str, chunk: &ComputedColumnChunk) -> Colu
         None
     };
 
+    // Only PLAIN values for non-nullable columns; nullable columns also use RLE_HYBRID
+    // for the def-level block.
+    let encodings = if chunk.nullable {
+        vec![Encoding::PLAIN, Encoding::RLE]
+    } else {
+        vec![Encoding::PLAIN]
+    };
+
     ColumnMetaData {
         type_: physical_type(chunk.physical_type),
-        encodings: vec![Encoding::PLAIN, Encoding::RLE],
+        encodings,
         path_in_schema: vec![column_name.to_string()],
         codec: CompressionCodec::UNCOMPRESSED,
         num_values: chunk.num_values,
         total_uncompressed_size: chunk.total_size,
+        // Codec is UNCOMPRESSED in v1, so compressed == uncompressed.
         total_compressed_size: chunk.total_size,
         key_value_metadata: None,
         data_page_offset: chunk.file_offset,
@@ -202,12 +222,15 @@ pub(crate) fn build_file_metadata(
             )));
         }
         let mut chunks: Vec<ColumnChunk> = Vec::with_capacity(rg.columns.len());
-        for (i, chunk) in rg.columns.iter().enumerate() {
-            let column_name = &schema.columns()[i].name;
+        for (col, chunk) in schema.columns().iter().zip(rg.columns.iter()) {
             chunks.push(ColumnChunk {
                 file_path: None,
+                // Parquet thrift docs describe `file_offset` as the byte offset of
+                // the ColumnMetaData; with `meta_data` embedded inline (as here),
+                // parquet-mr/parquet-cpp convention is to point this at the data
+                // page header start. We follow that convention.
                 file_offset: chunk.file_offset,
-                meta_data: Some(build_column_metadata(column_name, chunk)),
+                meta_data: Some(build_column_metadata(&col.name, chunk)),
                 offset_index_offset: None,
                 offset_index_length: None,
                 column_index_offset: None,
@@ -222,46 +245,54 @@ pub(crate) fn build_file_metadata(
             num_rows: rg.num_rows,
             sorting_columns: None,
             file_offset: None,
+            // UNCOMPRESSED in v1 → compressed == uncompressed.
             total_compressed_size: Some(rg.total_byte_size),
             ordinal: None,
         });
     }
 
+    let writer_id = format!("virtual-parquet {}", env!("CARGO_PKG_VERSION"));
+    // `column_orders` MUST be populated for readers to honor the modern typed
+    // `Statistics.min_value` / `max_value` fields (per Parquet spec). One entry
+    // per column, in schema order; v1 uses the standard type-defined ordering.
+    let column_orders = vec![ColumnOrder::TYPEORDER(TypeDefinedOrder {}); schema.len()];
     Ok(FileMetaData {
-        version: 1,
+        version: PARQUET_FORMAT_VERSION,
         schema: schema_elements,
         num_rows: total_rows,
         row_groups: rg_thrift,
         key_value_metadata: Some(vec![KeyValue {
             key: "writer".to_string(),
-            value: Some(format!("virtual-parquet {}", env!("CARGO_PKG_VERSION"))),
+            value: Some(writer_id.clone()),
         }]),
-        created_by: Some(format!("virtual-parquet {}", env!("CARGO_PKG_VERSION"))),
-        column_orders: None,
+        created_by: Some(writer_id),
+        column_orders: Some(column_orders),
         encryption_algorithm: None,
         footer_signing_key_metadata: None,
     })
 }
 
-/// Build a DataPageV1 page header for the given column-chunk page parameters.
+/// Build a `DataPageV1` page header for the given column-chunk page parameters.
+///
+/// `nullable` controls whether the def-level/rep-level encoding fields advertise
+/// `RLE` (used) or `PLAIN` (unused — the spec requires the field but Parquet
+/// readers ignore it when the schema element is REQUIRED).
 ///
 /// Returns `Err(Error::Encoding)` if any of the size fields exceeds `i32::MAX`
 /// (Parquet wire-format limit).
 pub(crate) fn build_data_page_header(
     num_values: i64,
     uncompressed_size: i64,
-    _has_definition_levels: bool,
+    nullable: bool,
 ) -> Result<PageHeader, Error> {
-    let uncompressed_page_size = i32::try_from(uncompressed_size).map_err(|_| {
-        Error::Encoding(format!(
-            "uncompressed_page_size {uncompressed_size} exceeds i32::MAX (Parquet limit)"
-        ))
-    })?;
-    let num_values_i32 = i32::try_from(num_values).map_err(|_| {
-        Error::Encoding(format!(
-            "num_values {num_values} exceeds i32::MAX (Parquet limit)"
-        ))
-    })?;
+    let uncompressed_page_size =
+        to_i32_or_encoding_err("uncompressed_page_size", uncompressed_size)?;
+    let num_values_i32 = to_i32_or_encoding_err("num_values", num_values)?;
+    let level_encoding = if nullable {
+        Encoding::RLE
+    } else {
+        Encoding::PLAIN
+    };
     Ok(PageHeader {
         type_: PageType::DATA_PAGE,
         uncompressed_page_size,
@@ -270,15 +301,17 @@ pub(crate) fn build_data_page_header(
         data_page_header: Some(DataPageHeader {
             num_values: num_values_i32,
             encoding: Encoding::PLAIN,
-            // Definition levels (when emitted) use RLE; if there are no def levels,
-            // the field still requires a value but is unused. Parquet readers ignore
-            // it when the schema element is REQUIRED.
-            definition_level_encoding: Encoding::RLE,
-            repetition_level_encoding: Encoding::RLE,
+            definition_level_encoding: level_encoding,
+            repetition_level_encoding: level_encoding,
             statistics: None,
         }),
         index_page_header: None,
         dictionary_page_header: None,
         data_page_header_v2: None,
     })
+}
+
+fn to_i32_or_encoding_err(name: &str, value: i64) -> Result<i32, Error> {
+    i32::try_from(value)
+        .map_err(|_| Error::Encoding(format!("{name} {value} exceeds i32::MAX (Parquet limit)")))
 }

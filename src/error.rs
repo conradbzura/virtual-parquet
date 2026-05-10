@@ -1,23 +1,18 @@
 //! Crate-wide error type. Variants map to Python exception classes by `bindings.rs`:
 //!
-//! | Rust variant                          | Python class                  |
-//! | ------------------------------------- | ----------------------------- |
-//! | `SchemaMismatch` / `InvalidSchema` /  |                               |
-//! |   `InvalidPlan`                       | `SchemaMismatchError`         |
-//! | `StatisticsMismatch`                  | `StatisticsMismatchError`    |
-//! | `ByteSizeMismatch`                    | `ByteSizeMismatchError`       |
-//! | `NonReplayableAdapter`                | `NonReplayableAdapterError`   |
-//! | `Adapter`                             | `VirtualParquetError` (base)  |
-//! | `Encoding` / `Parquet`                | `VirtualParquetError` (base)  |
-//! | `InvalidState` / `InvalidRange`       | `PyValueError`                |
-//! | `Io`                                  | `PyOSError`                   |
-//! | `Python(PyErr)`                       | the contained PyErr is        |
-//! |                                       | re-raised verbatim — used to  |
-//! |                                       | preserve typed exception      |
-//! |                                       | classes a user adapter raises |
+//! | Rust variant                                              | Python class                  |
+//! | --------------------------------------------------------- | ----------------------------- |
+//! | `SchemaMismatch`, `InvalidSchema`, `InvalidPlan`          | `SchemaMismatchError`         |
+//! | `StatisticsMismatch`                                      | `StatisticsMismatchError`     |
+//! | `ByteSizeMismatch`                                        | `ByteSizeMismatchError`       |
+//! | `NonReplayableAdapter`                                    | `NonReplayableAdapterError`   |
+//! | `Adapter`, `Encoding`, `Parquet`                          | `VirtualParquetError` (base)  |
+//! | `InvalidState`, `InvalidRange`                            | `PyValueError`                |
+//! | `Io`                                                      | `PyOSError`                   |
+//! | `Python(PyErr)` (feature-gated)                           | re-raised verbatim            |
 //!
-//! When a contributor adds a new variant, update the binding's error map at the
-//! same time and pin the test in `_native.pyi` to surface the change in CI.
+//! When a contributor adds a new variant, update [`crate::bindings::rust_error_to_pyerr`]
+//! at the same time and adjust the conformance assertion in CI.
 
 use thiserror::Error;
 
@@ -38,10 +33,10 @@ pub(crate) enum Error {
     #[error("byte size mismatch: {0}")]
     ByteSizeMismatch(String),
 
-    /// Reserved for future use when adapter declares non-replayability and the
-    /// byte server detects a second `fetch(i)` would be required. Constructor not
-    /// yet wired up — kept here so the Python `NonReplayableAdapterError` surface
-    /// is stable from day one.
+    /// Reserved for the library-side detection path described in
+    /// `contracts/public-api.md`. Not currently constructed in Rust; a Python
+    /// adapter raising `NonReplayableAdapterError` itself flows verbatim through
+    /// `Error::Python` (see `bindings.rs::classify_adapter_pyerr`).
     #[allow(dead_code)]
     #[error("non-replayable adapter: {0}")]
     NonReplayableAdapter(String),
@@ -68,6 +63,10 @@ pub(crate) enum Error {
     /// `bindings::rust_error_to_pyerr` so that typed exception classes a user adapter
     /// raises (e.g. `vp.NonReplayableAdapterError`) flow through to the engine
     /// without being flattened into a string.
+    ///
+    /// Note: forward-compat discipline #2 (plan.md) confines PyO3 references to
+    /// `bindings.rs`. This variant is feature-gated so `cargo check`/`cargo test`
+    /// without `--features extension-module` compile as a pure-Rust core.
     #[cfg(feature = "extension-module")]
     #[error("python error: {0}")]
     Python(pyo3::PyErr),

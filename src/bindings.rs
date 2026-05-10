@@ -1,15 +1,17 @@
-//! PyO3 bindings: convert Python adapter objects + dataclasses into Rust types,
+//! `PyO3` bindings: convert Python adapter objects + dataclasses into Rust types,
 //! expose `ByteServer` as `_native.VirtualFile`, and translate Rust errors into
 //! the corresponding Python exception classes.
 //!
-//! This is the only module in the crate that holds PyO3 references. Per forward-compat
-//! discipline #2 (`plan.md`), the Rust core is purely sync and Python-free.
+//! This is the only module in the crate that holds `PyO3` references. Per
+//! forward-compat discipline #2 (`plan.md`), the Rust core is purely sync and
+//! Python-free.
 
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::FromPyArrow;
-use pyo3::exceptions::{PyOSError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyException, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes};
 
@@ -18,6 +20,11 @@ use crate::adapter::{
 };
 use crate::error::Error;
 use crate::reader::ByteServer;
+
+// Python io.SEEK_SET / SEEK_CUR / SEEK_END.
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
 
 // ---------- Error type registration ----------
 
@@ -36,19 +43,32 @@ fn rust_error_to_pyerr(err: Error) -> PyErr {
         Error::StatisticsMismatch(msg) => StatisticsMismatchError::new_err(msg),
         Error::ByteSizeMismatch(msg) => ByteSizeMismatchError::new_err(msg),
         Error::NonReplayableAdapter(msg) => NonReplayableAdapterError::new_err(msg),
-        Error::Adapter(msg) => VirtualParquetError::new_err(msg),
+        Error::Adapter(msg) | Error::Encoding(msg) | Error::Parquet(msg) => {
+            VirtualParquetError::new_err(msg)
+        }
         Error::InvalidState(msg) | Error::InvalidRange(msg) => PyValueError::new_err(msg),
-        Error::Encoding(msg) | Error::Parquet(msg) => VirtualParquetError::new_err(msg),
         Error::Io(io) => PyOSError::new_err(io.to_string()),
     }
 }
 
-/// Wrap a Python exception that the adapter raised. If the exception is a
-/// `VirtualParquetError` subclass, propagate it verbatim via `Error::Python` so the
-/// typed class survives. Otherwise wrap the message in `Error::Adapter` so the engine
-/// sees a base `VirtualParquetError`.
+/// Wrap a Python exception that the adapter raised. Three cases:
+///
+/// 1. `BaseException`-only subclasses (`KeyboardInterrupt`, `SystemExit`, custom
+///    cancellation signals) propagate verbatim via `Error::Python`, so Ctrl+C and
+///    interpreter shutdown reach the runtime unchanged.
+/// 2. `VirtualParquetError` subclasses propagate verbatim so the typed Python class
+///    survives the round-trip back to the engine.
+/// 3. Any other `Exception` subclass (a generic adapter-side bug) is wrapped in
+///    `Error::Adapter` so the engine sees a base `VirtualParquetError` with the
+///    original message.
 fn classify_adapter_pyerr(py: Python<'_>, py_err: PyErr, context: String) -> Error {
     let exc_type = py_err.get_type(py);
+    let exception_type = py.get_type::<PyException>();
+    // Anything not derived from `Exception` (e.g. `KeyboardInterrupt`, `SystemExit`)
+    // must propagate unchanged — wrapping it would silently break Ctrl+C / shutdown.
+    if !exc_type.is_subclass(&exception_type).unwrap_or(false) {
+        return Error::Python(py_err);
+    }
     let vp_error_type = py.get_type::<VirtualParquetError>();
     if exc_type.is_subclass(&vp_error_type).unwrap_or(false) {
         Error::Python(py_err)
@@ -77,22 +97,27 @@ fn extract_column_type(value: &Bound<'_, PyAny>) -> PyResult<ColumnType> {
 /// Extract an integer attribute, rejecting Python `bool` (which subclasses `int` and
 /// would otherwise silently coerce `True` → 1, `False` → 0).
 fn extract_int_attr(parent: &Bound<'_, PyAny>, name: &str) -> PyResult<i64> {
-    let value = parent.getattr(name)?;
-    if is_python_bool(&value) {
-        return Err(PyTypeError::new_err(format!(
-            "{name} must be an int, not a bool"
-        )));
-    }
-    value.extract()
+    extract_int_attr_value(&parent.getattr(name)?, name)
 }
 
 /// True iff `value` is exactly a Python `bool` (`True` / `False`). Compares the
-/// Python type identity directly, since PyO3 0.23's `is_instance_of::<PyBool>`
+/// Python type identity directly, since `PyO3` 0.23's `is_instance_of::<PyBool>`
 /// does not surface a positive answer under abi3 in this configuration.
+// TODO(pyo3-upgrade): retest is_instance_of::<PyBool> when bumping PyO3.
 fn is_python_bool(value: &Bound<'_, PyAny>) -> bool {
     let py = value.py();
     let bool_type = py.get_type::<PyBool>();
     value.get_type().is(&bool_type)
+}
+
+/// Reject Python `bool` for fields documented as integer counts.
+fn reject_bool(value: &Bound<'_, PyAny>, label: &str) -> PyResult<()> {
+    if is_python_bool(value) {
+        return Err(PyTypeError::new_err(format!(
+            "{label} must be an int, not a bool"
+        )));
+    }
+    Ok(())
 }
 
 fn extract_column(value: &Bound<'_, PyAny>) -> PyResult<Column> {
@@ -119,32 +144,32 @@ fn extract_stat_value(value: &Bound<'_, PyAny>, ty: ColumnType) -> PyResult<Stat
             "min/max value for {ty_label} column does not match column type: {e}"
         ))
     };
+    // PyO3 silently coerces Python bool -> int / float (because bool subclasses
+    // int). Reject for every numeric branch except the Boolean column itself.
+    let bool_label = match ty {
+        ColumnType::Int32 => Some("Int32"),
+        ColumnType::Int64 => Some("Int64"),
+        ColumnType::Float32 => Some("Float32"),
+        ColumnType::Float64 => Some("Float64"),
+        ColumnType::Boolean | ColumnType::String => None,
+    };
+    if let Some(label) = bool_label {
+        if is_python_bool(value) {
+            return Err(map_err(
+                label,
+                PyTypeError::new_err("got bool, expected numeric"),
+            ));
+        }
+    }
     match ty {
-        ColumnType::Int32 => {
-            // bool subclasses int; reject so True/False can't satisfy an int-typed column.
-            if is_python_bool(value) {
-                return Err(map_err(
-                    "Int32",
-                    PyTypeError::new_err("got bool, expected int"),
-                ));
-            }
-            value
-                .extract()
-                .map(StatValue::Int32)
-                .map_err(|e| map_err("Int32", e))
-        }
-        ColumnType::Int64 => {
-            if is_python_bool(value) {
-                return Err(map_err(
-                    "Int64",
-                    PyTypeError::new_err("got bool, expected int"),
-                ));
-            }
-            value
-                .extract()
-                .map(StatValue::Int64)
-                .map_err(|e| map_err("Int64", e))
-        }
+        ColumnType::Int32 => value
+            .extract()
+            .map(StatValue::Int32)
+            .map_err(|e| map_err("Int32", e)),
+        ColumnType::Int64 => value
+            .extract()
+            .map(StatValue::Int64)
+            .map_err(|e| map_err("Int64", e)),
         ColumnType::Float32 => value
             .extract()
             .map(StatValue::Float32)
@@ -186,33 +211,29 @@ fn extract_column_statistics(
 
 /// Like `extract_int_attr` but operates on an already-fetched bound value.
 fn extract_int_attr_value(value: &Bound<'_, PyAny>, name: &str) -> PyResult<i64> {
-    if is_python_bool(value) {
-        return Err(PyTypeError::new_err(format!(
-            "{name} must be an int, not a bool"
-        )));
-    }
+    reject_bool(value, name)?;
     value.extract()
 }
 
 fn extract_row_group_plan(value: &Bound<'_, PyAny>, schema: &Schema) -> PyResult<RowGroupPlan> {
     let rows = extract_int_attr(value, "rows")?;
-    // Collect all column_stats entries first; defer length-and-content validation to
-    // RowGroupPlan::validate(&schema), which produces canonical error messages.
+    // Collect column_stats entries; once we go past the schema's column count we
+    // stop typed-extraction and push a sentinel `None` so the canonical
+    // length-mismatch error from RowGroupPlan::validate is what surfaces — rather
+    // than a misleading "min/max for Int64 column does not match" from a stat
+    // attached to a column that doesn't exist.
     let stats_obj = value.getattr("column_stats")?;
     let mut column_stats: Vec<Option<ColumnStatistics>> = Vec::new();
     for (idx, item) in stats_obj.try_iter()?.enumerate() {
         let item = item?;
+        if idx >= schema.columns().len() {
+            column_stats.push(None);
+            continue;
+        }
         if item.is_none() {
             column_stats.push(None);
         } else {
-            let col_type = schema
-                .columns()
-                .get(idx)
-                .map(|c| c.data_type)
-                // If the adapter handed us more entries than columns, fall back to
-                // an arbitrary type — RowGroupPlan::validate will reject the length
-                // mismatch with the canonical error.
-                .unwrap_or(ColumnType::Int64);
+            let col_type = schema.columns()[idx].data_type;
             column_stats.push(Some(extract_column_statistics(&item, col_type)?));
         }
     }
@@ -304,12 +325,54 @@ impl Adapter for PythonAdapter {
             let result = bound
                 .call_method1("fetch", (index,))
                 .map_err(|e| classify_adapter_pyerr(py, e, format!("fetch({index}) raised")))?;
-            let batch = RecordBatch::from_pyarrow_bound(&result).map_err(|e| {
-                classify_adapter_pyerr(py, e, format!("fetch({index}) returned a non-Arrow object"))
-            })?;
+            let batch = pyarrow_object_to_record_batch(py, &result, index)?;
             Ok(RowGroupData { batch })
         })
     }
+}
+
+/// Convert a Python object exposing the Arrow C Data Interface to a single
+/// `RecordBatch`. Tries `__arrow_c_array__` first (via `RecordBatch::from_pyarrow_bound`,
+/// which also handles `pyarrow.RecordBatch` instances directly); falls back to
+/// `__arrow_c_stream__` and consumes a single batch from the stream. The contract
+/// in `contracts/adapter-protocol.md` admits both interfaces.
+fn pyarrow_object_to_record_batch(
+    py: Python<'_>,
+    result: &Bound<'_, PyAny>,
+    index: u32,
+) -> Result<RecordBatch, Error> {
+    if let Ok(batch) = RecordBatch::from_pyarrow_bound(result) {
+        return Ok(batch);
+    }
+    if result
+        .hasattr("__arrow_c_stream__")
+        .map_err(|e| classify_adapter_pyerr(py, e, format!("fetch({index}) attribute check")))?
+    {
+        let stream = ArrowArrayStreamReader::from_pyarrow_bound(result).map_err(|e| {
+            classify_adapter_pyerr(
+                py,
+                e,
+                format!("fetch({index}) returned a non-Arrow stream object"),
+            )
+        })?;
+        let mut iter = stream.into_iter();
+        let first = iter.next().ok_or_else(|| {
+            Error::SchemaMismatch(format!(
+                "fetch({index}) returned an empty Arrow stream; expected exactly one row group's batch"
+            ))
+        })?;
+        let batch =
+            first.map_err(|e| Error::Adapter(format!("fetch({index}) stream error: {e}")))?;
+        if iter.next().is_some() {
+            return Err(Error::SchemaMismatch(format!(
+                "fetch({index}) returned an Arrow stream with multiple batches; expected exactly one row group's batch"
+            )));
+        }
+        return Ok(batch);
+    }
+    Err(Error::SchemaMismatch(format!(
+        "fetch({index}) returned a non-Arrow object (no __arrow_c_array__ or __arrow_c_stream__)"
+    )))
 }
 
 // ---------- VirtualFile PyO3 class ----------
@@ -350,14 +413,14 @@ impl VirtualFile {
             .allow_threads(|| self.server.total_size())
             .map_err(rust_error_to_pyerr)?;
         let new_pos = match whence {
-            0 => offset, // SEEK_SET
-            1 => self.position.checked_add(offset).ok_or_else(|| {
+            SEEK_SET => offset,
+            SEEK_CUR => self.position.checked_add(offset).ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "seek overflow: position={} offset={offset}",
                     self.position
                 ))
             })?,
-            2 => total.checked_add(offset).ok_or_else(|| {
+            SEEK_END => total.checked_add(offset).ok_or_else(|| {
                 PyValueError::new_err(format!("seek overflow: total={total} offset={offset}"))
             })?,
             other => {
@@ -399,6 +462,9 @@ impl VirtualFile {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    // The file-like protocol requires these as instance methods even when the
+    // receiver is unused.
+    #[allow(clippy::unused_self)]
     fn seekable(&self) -> bool {
         true
     }
@@ -407,6 +473,7 @@ impl VirtualFile {
         !self.server.is_closed()
     }
 
+    #[allow(clippy::unused_self)]
     fn writable(&self) -> bool {
         false
     }

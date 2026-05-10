@@ -7,7 +7,6 @@
 
 use std::collections::HashSet;
 
-use crate::encoding::plain::compute_fixed_value_size;
 use crate::error::Error;
 
 /// The logical column types supported in v1.
@@ -26,12 +25,13 @@ pub(crate) enum ColumnType {
 impl ColumnType {
     /// Returns true for types whose Plain-encoded byte size depends only on row count
     /// and null bitmap presence (i.e., no data scan required to compute size).
+    #[allow(dead_code)] // Future use; kept symmetric with `compute_fixed_value_size` in `encoding::plain`.
     #[must_use]
     pub(crate) fn is_fixed_width(self) -> bool {
-        match self {
-            Self::Int32 | Self::Int64 | Self::Float32 | Self::Float64 | Self::Boolean => true,
-            Self::String => false,
-        }
+        matches!(
+            self,
+            Self::Int32 | Self::Int64 | Self::Float32 | Self::Float64 | Self::Boolean
+        )
     }
 }
 
@@ -106,6 +106,14 @@ impl Schema {
     pub(crate) fn len(&self) -> usize {
         self.columns.len()
     }
+
+    /// Always `false` because `Schema::new` rejects empty input; provided to satisfy
+    /// the `clippy::len_without_is_empty` convention.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
 }
 
 /// A typed scalar used in adapter-declared statistics. Mirrors `ColumnType`.
@@ -145,10 +153,8 @@ impl StatValue {
 /// Per-column, per-row-group declared statistics.
 ///
 /// Any field set to `None` is emitted as **absent** in the Parquet footer (never
-/// fabricated as zero or empty). Construct via the builder methods or the binding
-/// extractor; `Default` is intentionally not derived to keep "all undeclared" an
-/// explicit choice (use `None` at the `Option<ColumnStatistics>` level instead).
-#[derive(Debug, Clone)]
+/// fabricated as zero or empty).
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ColumnStatistics {
     pub(crate) min: Option<StatValue>,
     pub(crate) max: Option<StatValue>,
@@ -156,12 +162,9 @@ pub(crate) struct ColumnStatistics {
 }
 
 impl ColumnStatistics {
+    #[must_use]
     pub(crate) fn new() -> Self {
-        Self {
-            min: None,
-            max: None,
-            null_count: None,
-        }
+        Self::default()
     }
 
     /// Cross-check against a single row group's row count and column type.
@@ -230,9 +233,14 @@ pub(crate) struct RowGroupPlan {
 }
 
 impl RowGroupPlan {
-    /// Validate the plan against a schema. Cross-check rows >= 0, column counts match,
-    /// per-column statistics against their declared column type, and adapter-declared
-    /// `column_byte_sizes` for fixed-width columns against the library-computed value.
+    /// Validate the plan against a schema: rows >= 0, column counts match, per-column
+    /// statistics match their declared column type, and any declared
+    /// `column_byte_sizes` are non-negative.
+    ///
+    /// Note: the fixed-width declared-vs-computed byte-size cross-check is done in
+    /// the byte-server's pre-pass path (see `reader::build_column_chunk_layout`)
+    /// after observed null counts are known. Doing it here would force adapters to
+    /// declare `null_count` whenever they declare `column_byte_sizes` — too narrow.
     pub(crate) fn validate(&self, schema: &Schema) -> Result<(), Error> {
         if self.rows < 0 {
             return Err(Error::InvalidPlan(format!(
@@ -246,6 +254,13 @@ impl RowGroupPlan {
                 self.column_stats.len(),
                 schema.len()
             )));
+        }
+        // Validate per-stat first so a malformed null_count surfaces as
+        // StatisticsMismatch rather than driving a downstream byte-size check.
+        for (i, stat) in self.column_stats.iter().enumerate() {
+            if let Some(s) = stat {
+                s.validate(schema.columns()[i].data_type, self.rows)?;
+            }
         }
         if let Some(sizes) = &self.column_byte_sizes {
             if sizes.len() != schema.len() {
@@ -262,33 +277,7 @@ impl RowGroupPlan {
                             "column_byte_sizes[{i}] must be >= 0, got {s}"
                         )));
                     }
-                    let col = &schema.columns()[i];
-                    if col.data_type.is_fixed_width() {
-                        // For fixed-width types we know the byte size from the row count
-                        // and (when declared) the null count. An adapter-declared value
-                        // must match exactly — otherwise the footer's offsets would
-                        // diverge from the bytes we'd actually emit.
-                        let null_count = self.column_stats[i]
-                            .as_ref()
-                            .and_then(|s| s.null_count)
-                            .unwrap_or(0);
-                        let expected =
-                            compute_fixed_value_size(col.data_type, self.rows, null_count)?;
-                        if expected != *s {
-                            return Err(Error::ByteSizeMismatch(format!(
-                                "column {:?}: declared column_byte_sizes[{i}]={s} \
-                                 differs from computed {expected} for fixed-width \
-                                 type {:?} with rows={} null_count={}",
-                                col.name, col.data_type, self.rows, null_count
-                            )));
-                        }
-                    }
                 }
-            }
-        }
-        for (i, stat) in self.column_stats.iter().enumerate() {
-            if let Some(s) = stat {
-                s.validate(schema.columns()[i].data_type, self.rows)?;
             }
         }
         Ok(())

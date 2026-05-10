@@ -38,6 +38,19 @@ unreachable_pub = "warn"
 pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
+# Numeric domain casts (i64<->usize, usize<->i64, u64->u8 in varint encoding) are
+# bounded by validated invariants — Parquet wire-format uses i32 for sizes, all
+# downcasts go through `i32::try_from` / `usize::try_from` at boundaries, and the
+# Plain encoder's varint truncations only operate on 7-bit-sized chunks. Allowing
+# these lints crate-wide keeps the byte-server arithmetic readable.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Documentation tokens like PyO3, RLE_HYBRID, DataPageV1 are project nomenclature;
+# requiring backticks on every mention is high-churn for low value.
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+unnested_or_patterns = "allow"
 
 [profile.release]
 lto = "thin"

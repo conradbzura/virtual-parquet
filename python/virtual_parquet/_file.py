@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import contextlib
 import io
+from types import TracebackType
 from typing import TYPE_CHECKING
 
 from virtual_parquet._native import VirtualFile as _NativeVirtualFile
 
 if TYPE_CHECKING:
     from virtual_parquet._bridge import _SyncAdapterFacade
+
+
+_CLOSED_MSG = "I/O operation on closed file"
 
 
 class VirtualParquetFile:
@@ -33,19 +37,32 @@ class VirtualParquetFile:
         self._closed = False
 
     def read(self, n: int = -1) -> bytes:
+        """Read up to ``n`` bytes from the current position. ``n=-1`` reads to EOF."""
         if self._closed:
-            raise ValueError("I/O operation on closed file")
+            raise ValueError(_CLOSED_MSG)
         return self._native.read(n)
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """Reposition the cursor; ``whence`` is one of :data:`io.SEEK_SET`/``CUR``/``END``."""
         if self._closed:
-            raise ValueError("I/O operation on closed file")
+            raise ValueError(_CLOSED_MSG)
         return self._native.seek(offset, whence)
 
     def tell(self) -> int:
+        """Return the current cursor position."""
         if self._closed:
-            raise ValueError("I/O operation on closed file")
+            raise ValueError(_CLOSED_MSG)
         return self._native.tell()
+
+    def size(self) -> int:
+        """Return the total size of the virtual Parquet object in bytes.
+
+        Triggers the metadata pre-pass on first call. Engines occasionally use this
+        as a fast-path before issuing range reads.
+        """
+        if self._closed:
+            raise ValueError(_CLOSED_MSG)
+        return self._native.size()
 
     def seekable(self) -> bool:
         return True
@@ -61,24 +78,34 @@ class VirtualParquetFile:
         return self._closed
 
     def close(self) -> None:
+        """Release native resources and the anyio portal (if started for an async adapter).
+
+        Idempotent. ``self._closed`` is set before the bridge is torn down so that a
+        portal-teardown failure still leaves subsequent I/O calls correctly raising
+        :class:`ValueError`.
+        """
         if self._closed:
             return
         try:
             self._native.close()
         finally:
-            self._bridge.close()
+            # Set the flag before bridge teardown so a portal-shutdown failure does
+            # not leave the wrapper in a half-closed state where read/seek/tell
+            # silently succeed on a closed native.
             self._closed = True
+            self._bridge.close()
 
     def __enter__(self) -> VirtualParquetFile:
         return self
 
     def __exit__(
         self,
-        _exc_type: object,
-        _exc_value: object,
-        _traceback: object,
-    ) -> None:
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
         self.close()
+        return False
 
     def __del__(self) -> None:
         # Best-effort cleanup; finalizer-time errors are unraisable warnings anyway.

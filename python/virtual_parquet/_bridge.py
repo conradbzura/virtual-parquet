@@ -14,33 +14,41 @@ and stopped on ``close()``. Sync adapters never start a portal.
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio.from_thread
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from anyio.from_thread import BlockingPortal
+
     from virtual_parquet._types import RowGroupPlan, Schema
-    from virtual_parquet.adapter import Adapter, AsyncAdapter
+    from virtual_parquet.adapter import Adapter, ArrowBatchLike, AsyncAdapter
 
 
 __all__ = ["_SyncAdapterFacade"]
 
 
 class _SyncAdapterFacade:
-    """Adapt either an Adapter or AsyncAdapter to a uniform sync interface for the
-    Rust binding. Owns the anyio blocking portal when the underlying adapter is async.
+    """Adapt either an Adapter or AsyncAdapter to a uniform sync interface.
+
+    Owns the anyio blocking portal when the underlying adapter is async. The
+    Rust binding consumes this facade and never sees the underlying async shape.
     """
 
     def __init__(self, adapter: Adapter | AsyncAdapter) -> None:
         self._adapter = adapter
         self._is_async = self._detect_async(adapter)
         self._portal_cm: Any = None
-        self._portal: Any = None
+        self._portal: BlockingPortal | None = None
         if self._is_async:
-            self._portal_cm = anyio.from_thread.start_blocking_portal()
-            self._portal = self._portal_cm.__enter__()
+            cm = anyio.from_thread.start_blocking_portal()
+            # Only assign _portal_cm after __enter__ succeeds so a failed start
+            # does not leave a never-entered context manager that close() would
+            # later try to exit.
+            self._portal = cm.__enter__()
+            self._portal_cm = cm
 
     @staticmethod
     def _detect_async(adapter: Adapter | AsyncAdapter) -> bool:
@@ -68,19 +76,28 @@ class _SyncAdapterFacade:
 
     def row_group_plan(self, index: int) -> RowGroupPlan:
         if self._portal is None:
-            return self._adapter.row_group_plan(index)  # type: ignore[return-value]
-        return self._portal.call(self._call_async, self._adapter.row_group_plan, index)
+            return cast("RowGroupPlan", self._adapter.row_group_plan(index))
+        async_plan = cast(
+            "Callable[[int], Awaitable[RowGroupPlan]]", self._adapter.row_group_plan
+        )
+        return self._portal.call(self._call_async, async_plan, index)
 
-    def fetch(self, index: int) -> Any:
+    def fetch(self, index: int) -> ArrowBatchLike:
         if self._portal is None:
             return self._adapter.fetch(index)
-        return self._portal.call(self._call_async, self._adapter.fetch, index)
+        async_fetch = cast(
+            "Callable[[int], Awaitable[ArrowBatchLike]]", self._adapter.fetch
+        )
+        return self._portal.call(self._call_async, async_fetch, index)
 
     @staticmethod
-    async def _call_async(coro_fn: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+    async def _call_async(
+        coro_fn: Callable[..., Awaitable[Any]], *args: Any
+    ) -> Any:
         return await coro_fn(*args)
 
     def close(self) -> None:
+        """Tear down the anyio portal if one was started. Idempotent."""
         if self._portal_cm is not None:
             self._portal_cm.__exit__(None, None, None)
             self._portal = None

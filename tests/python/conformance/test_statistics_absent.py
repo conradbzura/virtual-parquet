@@ -2,8 +2,14 @@
 
 Covers FR-008: when an adapter declines to declare a statistic, the library MUST
 emit the corresponding Statistics field as absent rather than fabricating a value.
-PyArrow surfaces this via ``column.statistics is None`` or, when a Statistics
-object is present, via ``has_null_count`` / ``has_min_max`` returning False.
+
+The library populates the modern typed `Statistics.min_value` / `max_value` pair
+and leaves the legacy unsigned-byte-ordered `min` / `max` fields absent (parquet-mr
+convention; the legacy ordering is wrong for signed numeric/float types with
+negative values). PyArrow surfaces declared bounds via `Statistics.min_raw` /
+`.max_raw`; declined columns surface as `column.statistics is None` or, when a
+Statistics object is present, with `has_null_count` False and `min_raw`/`max_raw`
+both None.
 """
 
 from __future__ import annotations
@@ -94,10 +100,15 @@ class _StatsMixedAdapter(vp.BaseAdapter):
 
 
 def _column_stats_absent(stats: pq.Statistics | None) -> bool:
-    """True iff the column's footer Statistics declares no min/max and no null_count."""
+    """True iff the column's footer Statistics declares no min/max and no null_count.
+
+    Reads the modern typed `min_raw`/`max_raw` accessors plus `has_null_count`
+    so the check is valid regardless of which Statistics fields the writer
+    populates.
+    """
     if stats is None:
         return True
-    return not stats.has_null_count and not stats.has_min_max
+    return not stats.has_null_count and stats.min_raw is None and stats.max_raw is None
 
 
 def test_all_columns_declined_via_none_emit_absent_statistics() -> None:
@@ -114,7 +125,8 @@ def test_all_columns_declined_via_none_emit_absent_statistics() -> None:
             assert _column_stats_absent(stats), (
                 f"column {col_idx} stats unexpectedly present: "
                 f"has_null_count={stats.has_null_count if stats else None}, "
-                f"has_min_max={stats.has_min_max if stats else None}, "
+                f"min_raw={stats.min_raw if stats else None}, "
+                f"max_raw={stats.max_raw if stats else None}, "
                 f"null_count={stats.null_count if stats else None}"
             )
 
@@ -133,7 +145,8 @@ def test_all_columns_declined_via_all_none_fields_emit_absent_statistics() -> No
             assert _column_stats_absent(stats), (
                 f"column {col_idx} stats unexpectedly present despite all fields None: "
                 f"has_null_count={stats.has_null_count if stats else None}, "
-                f"has_min_max={stats.has_min_max if stats else None}, "
+                f"min_raw={stats.min_raw if stats else None}, "
+                f"max_raw={stats.max_raw if stats else None}, "
                 f"null_count={stats.null_count if stats else None}"
             )
 
@@ -153,14 +166,16 @@ def test_mixed_declared_and_declined_only_declared_appears() -> None:
         assert id_stats is not None, "declared id stats missing"
         assert id_stats.has_null_count
         assert id_stats.null_count == 0
-        assert id_stats.has_min_max
-        assert id_stats.min == 1
-        assert id_stats.max == 3
+        # The library populates the modern typed `min_value`/`max_value` only;
+        # PyArrow surfaces them via `min_raw`/`max_raw`.
+        assert id_stats.min_raw == 1
+        assert id_stats.max_raw == 3
 
         label_stats = rg.column(1).statistics
         assert _column_stats_absent(label_stats), (
             f"label column declined stats but Statistics surfaced as present: "
             f"has_null_count={label_stats.has_null_count if label_stats else None}, "
-            f"has_min_max={label_stats.has_min_max if label_stats else None}, "
+            f"min_raw={label_stats.min_raw if label_stats else None}, "
+            f"max_raw={label_stats.max_raw if label_stats else None}, "
             f"null_count={label_stats.null_count if label_stats else None}"
         )

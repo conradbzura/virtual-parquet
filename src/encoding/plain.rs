@@ -28,7 +28,16 @@ pub(crate) fn compute_fixed_value_size(
     rows: i64,
     null_count: i64,
 ) -> Result<i64, Error> {
-    let non_null = rows.saturating_sub(null_count);
+    let non_null = rows
+        .checked_sub(null_count)
+        .filter(|n| *n >= 0)
+        .ok_or_else(|| {
+            // Defensive: the byte-server validates `null_count <= rows` upstream, so
+            // this branch is unreachable in normal flow.
+            Error::Encoding(format!(
+                "compute_fixed_value_size precondition violated: rows={rows} null_count={null_count}"
+            ))
+        })?;
     let mul = |w: i64| -> Result<i64, Error> {
         non_null.checked_mul(w).ok_or_else(|| {
             Error::Encoding(format!(
@@ -39,8 +48,8 @@ pub(crate) fn compute_fixed_value_size(
     match ty {
         ColumnType::Int32 | ColumnType::Float32 => mul(4),
         ColumnType::Int64 | ColumnType::Float64 => mul(8),
-        // Bit-packed: ceil(non_null / 8) bytes. `i64::div_ceil` is unstable on stable
-        // Rust through 1.85, so spell it out with a saturating add.
+        // Bit-packed: ceil(non_null / 8) bytes. Signed `i64::div_ceil` is unstable on
+        // stable Rust through 1.85; spell it out with a saturating add.
         ColumnType::Boolean => Ok(non_null.saturating_add(7) / 8),
         ColumnType::String => Err(Error::Encoding(
             "compute_fixed_value_size called with String (variable-width)".into(),
@@ -49,11 +58,11 @@ pub(crate) fn compute_fixed_value_size(
 }
 
 /// Compute the encoded byte size of a definition-level block for a nullable column
-/// in a DataPageV1, given the row count.
+/// in a `DataPageV1`, given the row count.
 ///
-/// Layout (DataPageV1 with max_def_level = 1):
+/// Layout (`DataPageV1` with `max_def_level = 1`):
 /// - 4-byte little-endian length prefix
-/// - One bit-packed RLE_HYBRID run header (varint), encoding `ceil(rows / 8)` groups of 8
+/// - One bit-packed `RLE_HYBRID` run header (varint), encoding `ceil(rows / 8)` groups of 8
 /// - `ceil(rows / 8)` data bytes (one bit per def level, LSB-first within each byte)
 #[must_use]
 pub(crate) fn compute_def_levels_size(rows: i64) -> i64 {
@@ -61,9 +70,12 @@ pub(crate) fn compute_def_levels_size(rows: i64) -> i64 {
     if rows <= 0 {
         return 4; // length prefix only; the body is empty
     }
-    // `i64::div_ceil` is unstable on stable Rust through 1.85.
-    let groups = (rows + 7) / 8;
-    let header_size = varint_size(u64::try_from(groups).unwrap_or(u64::MAX) * 2 + 1) as i64;
+    // Signed `i64::div_ceil` is unstable on stable Rust through 1.85; saturate to
+    // mirror the discipline at line ~31.
+    let groups = rows.saturating_add(7) / 8;
+    // groups is non-negative by construction (rows > 0 here).
+    let header_size =
+        varint_size(u64::try_from(groups).expect("groups is non-negative") * 2 + 1) as i64;
     let data_size = groups; // 1 byte per group
     4 + header_size + data_size
 }
@@ -166,21 +178,38 @@ fn maybe_def_block(array: &dyn Array, nullable: bool) -> Result<Vec<u8>, Error> 
     }
 }
 
+/// Encode a fixed-width primitive column by walking valid indices and emitting
+/// the per-element little-endian bytes via the supplied closure. Used by the
+/// Int32/Int64/Float32/Float64 encoders to share the per-value loop.
+fn encode_primitive<A, F, B>(
+    array: &A,
+    nullable: bool,
+    width: usize,
+    to_le: F,
+) -> Result<(Vec<u8>, Vec<u8>), Error>
+where
+    A: Array,
+    F: Fn(&A, usize) -> B,
+    B: AsRef<[u8]>,
+{
+    check_no_nulls_when_required(array, nullable)?;
+    let non_null = array.len() - array.null_count();
+    let mut values = Vec::with_capacity(non_null * width);
+    for i in 0..array.len() {
+        if array.is_valid(i) {
+            values.extend_from_slice(to_le(array, i).as_ref());
+        }
+    }
+    Ok((maybe_def_block(array, nullable)?, values))
+}
+
 /// Encode an Int32 column: emits 4 LE bytes per non-null value, plus the def-level
 /// block if the column is nullable. Returns `(def_levels_block, values_block)`.
 pub(crate) fn encode_int32_values(
     array: &Int32Array,
     nullable: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    check_no_nulls_when_required(array, nullable)?;
-    let non_null = array.len() - array.null_count();
-    let mut values = Vec::with_capacity(non_null * 4);
-    for i in 0..array.len() {
-        if array.is_valid(i) {
-            values.extend_from_slice(&array.value(i).to_le_bytes());
-        }
-    }
-    Ok((maybe_def_block(array, nullable)?, values))
+    encode_primitive(array, nullable, 4, |a, i| a.value(i).to_le_bytes())
 }
 
 /// Encode an Int64 column.
@@ -188,15 +217,7 @@ pub(crate) fn encode_int64_values(
     array: &Int64Array,
     nullable: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    check_no_nulls_when_required(array, nullable)?;
-    let non_null = array.len() - array.null_count();
-    let mut values = Vec::with_capacity(non_null * 8);
-    for i in 0..array.len() {
-        if array.is_valid(i) {
-            values.extend_from_slice(&array.value(i).to_le_bytes());
-        }
-    }
-    Ok((maybe_def_block(array, nullable)?, values))
+    encode_primitive(array, nullable, 8, |a, i| a.value(i).to_le_bytes())
 }
 
 /// Encode a Float32 column.
@@ -204,15 +225,7 @@ pub(crate) fn encode_float32_values(
     array: &Float32Array,
     nullable: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    check_no_nulls_when_required(array, nullable)?;
-    let non_null = array.len() - array.null_count();
-    let mut values = Vec::with_capacity(non_null * 4);
-    for i in 0..array.len() {
-        if array.is_valid(i) {
-            values.extend_from_slice(&array.value(i).to_le_bytes());
-        }
-    }
-    Ok((maybe_def_block(array, nullable)?, values))
+    encode_primitive(array, nullable, 4, |a, i| a.value(i).to_le_bytes())
 }
 
 /// Encode a Float64 column.
@@ -220,15 +233,7 @@ pub(crate) fn encode_float64_values(
     array: &Float64Array,
     nullable: bool,
 ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-    check_no_nulls_when_required(array, nullable)?;
-    let non_null = array.len() - array.null_count();
-    let mut values = Vec::with_capacity(non_null * 8);
-    for i in 0..array.len() {
-        if array.is_valid(i) {
-            values.extend_from_slice(&array.value(i).to_le_bytes());
-        }
-    }
-    Ok((maybe_def_block(array, nullable)?, values))
+    encode_primitive(array, nullable, 8, |a, i| a.value(i).to_le_bytes())
 }
 
 /// Encode a Boolean column: bit-packed, LSB-first within each byte, non-null values only.

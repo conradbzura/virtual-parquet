@@ -27,6 +27,9 @@ wheels/
 *.abi3.so
 *.so
 
+# Lockfiles (this is a library; consumers manage their own resolution)
+uv.lock
+
 # Editors / OS
 .DS_Store
 .idea/

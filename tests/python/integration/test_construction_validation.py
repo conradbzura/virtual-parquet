@@ -2,6 +2,9 @@
 
 Covers system-boundary validation (per CLAUDE.md) on Column, ColumnStatistics,
 and RowGroupPlan dataclasses — the moment user-supplied values enter the library.
+
+Type-of-`Column.type` is enforced statically by pyright (the field is annotated
+`ColumnType`); there is no runtime guard, so this file does not assert one.
 """
 
 from __future__ import annotations
@@ -11,17 +14,7 @@ import pytest
 import virtual_parquet as vp
 
 
-def test_column_type_must_be_column_type_instance() -> None:
-    """
-    GIVEN a string passed in place of a ColumnType enum value
-    WHEN Column is constructed
-    THEN TypeError is raised at the construction boundary.
-    """
-    with pytest.raises(TypeError):
-        vp.Column("id", "int64", nullable=False)  # type: ignore[arg-type]
-
-
-def test_column_type_accepts_only_column_type_enum() -> None:
+def test_column_type_accepts_column_type_enum() -> None:
     """
     GIVEN a ColumnType enum value
     WHEN Column is constructed

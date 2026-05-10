@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # The extension-module feature is the only configuration this crate
+      # ships in (the lib gates the PyO3 bindings module behind it). Without
+      # it every type in src/ is unused and clippy fires dead_code under
+      # -D warnings.
+      - run: cargo clippy --all-targets --features extension-module -- -D warnings
+      - run: cargo test --all --features extension-module
+
+  python:
+    name: maturin + ruff + pyright + pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.85"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install maturin and dev deps
+        # Set up a venv so `maturin develop --release` has somewhere to install
+        # to (the CLI subcommand requires VIRTUAL_ENV / CONDA_PREFIX; pip's
+        # editable-build path doesn't honor --release cleanly via env vars).
+        # The single `maturin develop` call both builds the extension in
+        # release mode and installs the project's dev extras. Subsequent steps
+        # (ruff/pyright/pytest) pick up the venv via $GITHUB_PATH.
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip maturin
+          .venv/bin/maturin develop --release --extras dev
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+      - name: ruff
+        run: ruff check python tests/python
+      - name: pyright
+        # pyarrow does not ship type stubs, so pyright strict cannot fully type-
+        # check the test suite. Restrict strict checking to the package source.
+        run: pyright python
+      - name: pytest
+        run: pytest -q

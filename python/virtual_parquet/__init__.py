@@ -19,10 +19,8 @@ Quickstart::
 
     table = pq.read_table(vp.open(MyAdapter()))
 
-The public surface is enumerated in ``__all__`` below and matches
-``contracts/public-api.md``. Symbols outside this list (including everything in
-``virtual_parquet._native``, ``virtual_parquet._bridge``, ``virtual_parquet._file``,
-``virtual_parquet._types``, and ``virtual_parquet._errors``) are internal.
+The public surface is enumerated in ``__all__`` below. Any underscore-prefixed
+submodule is internal and may change in any release.
 """
 
 from __future__ import annotations
@@ -63,7 +61,15 @@ def open(adapter: Adapter | AsyncAdapter) -> VirtualParquetFile:
     ``anyio``.
     """
     bridge = _SyncAdapterFacade(adapter)
-    native = _NativeVirtualFile(bridge)
+    try:
+        native = _NativeVirtualFile(bridge)
+    except BaseException:
+        # Native construction can raise (bad row_group_count, schema extraction,
+        # etc.). The bridge has already eagerly started an anyio portal for an
+        # async adapter; tear it down before propagating so the worker thread
+        # doesn't leak. BaseException covers Ctrl+C mid-init too.
+        bridge.close()
+        raise
     return VirtualParquetFile(native, bridge)
 
 

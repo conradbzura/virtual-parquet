@@ -1,7 +1,10 @@
 """Type stubs for the PyO3 native extension module.
 
-These signatures must stay in sync with ``src/bindings.rs``. The native module is
-internal — see ``contracts/public-api.md``.
+These signatures are hand-maintained from ``src/bindings.rs``; CI runs an
+import-time conformance check (see ``virtual_parquet`` package init) that
+asserts every method/attribute declared here exists on the live extension and
+vice versa. If the build fails on stub drift, update both ``src/bindings.rs``
+and this file together. The native module is internal.
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ class VirtualFile:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool | None: ...
+    ) -> bool: ...
 
 class VirtualParquetError(Exception): ...
 class SchemaMismatchError(VirtualParquetError): ...
