@@ -1,0 +1,58 @@
+[package]
+name = "virtual-parquet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Scaffolding for serving non-Parquet data sources to mainstream Parquet-consuming engines via a stable adapter contract."
+repository = "https://github.com/conradbzura/virtual-parquet"
+readme = "README.md"
+keywords = ["parquet", "arrow", "adapter", "streaming"]
+categories = ["database", "encoding"]
+
+[lib]
+name = "virtual_parquet"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enabled by maturin when building the Python wheel; off by default so that
+# `cargo check` and `cargo test` can link against libpython normally.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+parquet = { version = "54", default-features = false }
+arrow = { version = "54", default-features = false, features = ["pyarrow"] }
+arrow-array = "54"
+arrow-schema = "54"
+arrow-buffer = "54"
+pyo3 = { version = "0.23", features = ["abi3-py310"] }
+thiserror = "2"
+thrift = "0.17"
+tracing = "0.1"
+
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+# Numeric domain casts (i64<->usize, usize<->i64, u64->u8 in varint encoding) are
+# bounded by validated invariants — Parquet wire-format uses i32 for sizes, all
+# downcasts go through `i32::try_from` / `usize::try_from` at boundaries, and the
+# Plain encoder's varint truncations only operate on 7-bit-sized chunks. Allowing
+# these lints crate-wide keeps the byte-server arithmetic readable.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Documentation tokens like PyO3, RLE_HYBRID, DataPageV1 are project nomenclature;
+# requiring backticks on every mention is high-churn for low value.
+doc_markdown = "allow"
+needless_pass_by_value = "allow"
+unnested_or_patterns = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

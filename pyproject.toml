@@ -1,0 +1,89 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "virtual-parquet"
+version = "0.1.0"
+description = "Serve non-Parquet data sources to mainstream Parquet engines via a stable Python adapter contract."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Conrad" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
+dependencies = [
+    "anyio>=4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pyarrow>=15",
+    "ruff>=0.5",
+    "pyright>=1.1",
+    "trio>=0.25",
+]
+
+[tool.maturin]
+module-name = "virtual_parquet._native"
+python-source = "python"
+features = ["extension-module"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["python", "tests/python"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+    "RUF", # ruff-specific
+    "PTH", # pathlib usage
+    "PL",  # pylint
+]
+ignore = [
+    "PLR0913", # too many arguments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["PLR2004"]  # magic numbers acceptable in tests
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "strict"
+include = ["python", "tests/python"]
+exclude = ["**/__pycache__", "target", "build", "dist"]
+reportMissingImports = "error"
+reportMissingTypeStubs = "warning"
+# Underscore-prefixed names denote package-internal symbols, not module-private.
+# Intra-package imports of those names are intentional — see contracts/public-api.md.
+reportPrivateUsage = "none"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests/python"]
+python_files = ["test_*.py"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]

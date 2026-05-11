@@ -2,3 +2,44 @@ CLAUDE.md
 specs
 .claude
 .specify
+
+# Rust
+target/
+*.rs.bk
+*.rlib
+*.prof*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+
+# Maturin
+wheels/
+*.abi3.so
+*.so
+
+# Lockfiles (this is a library; consumers manage their own resolution)
+uv.lock
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# Environment
+.env
+.env.*
+
+# Local MCP / tool configuration (contains user-specific paths)
+.mcp.json
