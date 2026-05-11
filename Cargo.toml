@@ -29,6 +29,7 @@ arrow-buffer = "54"
 pyo3 = { version = "0.23", features = ["abi3-py310"] }
 thiserror = "2"
 thrift = "0.17"
+tracing = "0.1"
 
 [lints.rust]
 unsafe_code = "deny"

@@ -26,8 +26,8 @@ use crate::encoding::plain::{
 };
 use crate::error::Error;
 use crate::footer::{
-    build_data_page_header, build_file_metadata, encode_stat_value, serialize_thrift,
-    ComputedColumnChunk, ComputedRowGroup, PARQUET_MAGIC,
+    build_data_page_header, build_file_metadata, serialize_thrift, DEFAULT_FOOTER_PADDING_TARGET,
+    PARQUET_MAGIC,
 };
 
 /// Length of the leading and trailing PAR1 magic.
@@ -41,27 +41,31 @@ const POISON_MSG: &str = "byte-server lock poisoned";
 
 /// Layout of a single column chunk within the virtual file.
 #[derive(Debug, Clone)]
-struct ColumnChunkLayout {
-    column_type: ColumnType,
-    nullable: bool,
-    file_offset: i64,
-    page_header_bytes: Vec<u8>,
-    def_levels_size: i64,
-    values_size: i64,
+pub(crate) struct ColumnChunkLayout {
+    pub(crate) column_type: ColumnType,
+    pub(crate) nullable: bool,
+    pub(crate) file_offset: i64,
+    /// Pre-encoded data-page header thrift bytes. Computed in closed form during
+    /// the metadata pre-pass and served directly by the fast path in
+    /// [`read_column_chunks_segment`] so engines probing the head of each chunk
+    /// avoid triggering a full row-group fetch + encode.
+    pub(crate) page_header_bytes: Vec<u8>,
+    pub(crate) def_levels_size: i64,
+    pub(crate) values_size: i64,
 }
 
 impl ColumnChunkLayout {
-    fn total_size(&self) -> i64 {
+    pub(crate) fn total_size(&self) -> i64 {
         self.page_header_bytes.len() as i64 + self.def_levels_size + self.values_size
     }
 }
 
 #[derive(Debug, Clone)]
-struct RowGroupLayout {
-    num_rows: i64,
-    columns: Vec<ColumnChunkLayout>,
+pub(crate) struct RowGroupLayout {
+    pub(crate) num_rows: i64,
+    pub(crate) columns: Vec<ColumnChunkLayout>,
     /// Total uncompressed byte size = sum of column chunks.
-    total_byte_size: i64,
+    pub(crate) total_byte_size: i64,
 }
 
 #[derive(Debug)]
@@ -98,16 +102,40 @@ enum State {
     Closed,
 }
 
+/// Tunables for [`ByteServer`]. Defaults match the values exercised by the
+/// shipped Python wheel; advanced Rust callers (or future Python config knobs)
+/// can override via [`ByteServer::with_options`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ByteServerOptions {
+    /// Minimum size in bytes of the serialized footer thrift. See
+    /// [`DEFAULT_FOOTER_PADDING_TARGET`] for the rationale behind the default.
+    pub(crate) footer_padding_target: usize,
+}
+
+impl Default for ByteServerOptions {
+    fn default() -> Self {
+        Self {
+            footer_padding_target: DEFAULT_FOOTER_PADDING_TARGET,
+        }
+    }
+}
+
 pub(crate) struct ByteServer {
     adapter: Arc<dyn Adapter>,
+    options: ByteServerOptions,
     state: Mutex<State>,
     cv: Condvar,
 }
 
 impl ByteServer {
     pub(crate) fn new(adapter: Arc<dyn Adapter>) -> Self {
+        Self::with_options(adapter, ByteServerOptions::default())
+    }
+
+    pub(crate) fn with_options(adapter: Arc<dyn Adapter>, options: ByteServerOptions) -> Self {
         Self {
             adapter,
+            options,
             state: Mutex::new(State::Created),
             cv: Condvar::new(),
         }
@@ -247,42 +275,15 @@ impl ByteServer {
             }
         }
 
-        // Now build the footer with computed offsets.
-        let mut computed_groups: Vec<ComputedRowGroup> = Vec::with_capacity(row_groups.len());
-        for (rg_layout, plan) in row_groups.iter().zip(plans.iter()) {
-            let mut chunks: Vec<ComputedColumnChunk> = Vec::with_capacity(rg_layout.columns.len());
-            for (col_idx, col_layout) in rg_layout.columns.iter().enumerate() {
-                let stats = plan.column_stats.get(col_idx).cloned().flatten();
-                let (min_value, max_value, declared_null_count) = match stats {
-                    Some(s) => (
-                        s.min.as_ref().map(encode_stat_value),
-                        s.max.as_ref().map(encode_stat_value),
-                        s.null_count,
-                    ),
-                    None => (None, None, None),
-                };
-                // FR-008: pass adapter-declared null_count through unchanged. When the
-                // adapter declined to declare it, leave it absent — never substitute the
-                // observed value.
-                chunks.push(ComputedColumnChunk {
-                    physical_type: col_layout.column_type,
-                    nullable: col_layout.nullable,
-                    file_offset: col_layout.file_offset,
-                    total_size: col_layout.total_size(),
-                    num_values: rg_layout.num_rows,
-                    null_count: declared_null_count,
-                    min_value,
-                    max_value,
-                });
-            }
-            computed_groups.push(ComputedRowGroup {
-                num_rows: rg_layout.num_rows,
-                total_byte_size: rg_layout.total_byte_size,
-                columns: chunks,
-            });
-        }
-
-        let metadata = build_file_metadata(&schema, computed_groups)?;
+        // Now build the footer directly from the layouts and plans. Stats / null
+        // counts / encoded min/max are read off the plans inline inside
+        // build_file_metadata, dropping the prior `Computed*` DTO layer.
+        let metadata = build_file_metadata(
+            &schema,
+            &row_groups,
+            &plans,
+            self.options.footer_padding_target,
+        )?;
         let footer_bytes = serialize_thrift(&metadata)?;
         let footer_offset = cursor;
         let footer_len_i64 = i64::try_from(footer_bytes.len()).map_err(|_| {
@@ -601,6 +602,10 @@ fn sum_string_bytes<O: arrow_array::OffsetSizeTrait>(
     total
 }
 
+/// Read a single segment of column-chunk territory at `pos`. The fast path
+/// (page-header prefix served from layout, no adapter call) is delegated to
+/// [`try_serve_page_header`]; on miss the slow path materializes the column
+/// chunk via [`ensure_chunk`].
 fn read_column_chunks_segment(
     out: &mut Vec<u8>,
     pos: i64,
@@ -612,30 +617,45 @@ fn read_column_chunks_segment(
     let (rg_idx, col_idx, local_offset) = locate_column_chunk(pos, layout)?;
     let layout_col = &layout.row_groups[rg_idx as usize].columns[col_idx];
 
-    // Fast path: serve the page-header prefix directly from the layout
-    // without invoking the adapter or encoding the row group's data. The
-    // page header bytes are computed in closed form during the metadata
-    // pre-pass and stored in `layout_col.page_header_bytes`. Engines like
-    // PyArrow probe the first few hundred bytes of every column chunk at
-    // file open to validate structure / build a scan plan; without this
-    // shortcut every probe triggers a full row-group fetch + encode.
-    //
-    // If the request straddles the header/data boundary we serve only
-    // up to the header end in this segment and let `read_range` re-enter
-    // for the data portion (which falls through to `ensure_chunk`).
-    let header_len = layout_col.page_header_bytes.len();
-    if local_offset < header_len {
-        let header_remaining = header_len - local_offset;
-        let take = header_remaining.min((end - pos) as usize);
-        out.extend_from_slice(&layout_col.page_header_bytes[local_offset..local_offset + take]);
-        return Ok(take as i64);
+    let remaining = (end - pos) as usize;
+    if let Some(taken) = try_serve_page_header(out, layout_col, local_offset, remaining) {
+        tracing::trace!(
+            target: "virtual_parquet::reader",
+            rg_idx, col_idx, local_offset, taken,
+            "served page-header bytes from layout",
+        );
+        return Ok(taken as i64);
     }
 
     let chunk_bytes = ensure_chunk(rg_idx, col_idx, layout, cache, adapter)?;
     let chunk_remaining = chunk_bytes.len() - local_offset;
-    let take = chunk_remaining.min((end - pos) as usize);
+    let take = chunk_remaining.min(remaining);
     out.extend_from_slice(&chunk_bytes[local_offset..local_offset + take]);
     Ok(take as i64)
+}
+
+/// Fast path for column-chunk reads: when `local_offset` lies inside the
+/// pre-computed page header, copy header bytes directly from the layout into
+/// `out` and return how many were taken.
+///
+/// Returns `None` when the offset is past the header and the caller must fall
+/// through to materializing the chunk via the adapter. Skipping `ensure_chunk`
+/// here is safe because `ensure_chunk` has no side effects beyond cache
+/// installation and the header bytes do not depend on the encoded data.
+fn try_serve_page_header(
+    out: &mut Vec<u8>,
+    layout_col: &ColumnChunkLayout,
+    local_offset: usize,
+    remaining: usize,
+) -> Option<usize> {
+    let header_len = layout_col.page_header_bytes.len();
+    if local_offset >= header_len {
+        return None;
+    }
+    let header_remaining = header_len - local_offset;
+    let take = header_remaining.min(remaining);
+    out.extend_from_slice(&layout_col.page_header_bytes[local_offset..local_offset + take]);
+    Some(take)
 }
 
 /// Binary-search the chunk index for the column chunk containing `pos`.
@@ -671,11 +691,19 @@ fn ensure_chunk<'a>(
 ) -> Result<&'a [u8], Error> {
     let needs_install = !matches!(cache, Some(c) if c.index == rg_idx);
     if needs_install {
+        let evicted = cache.as_ref().map(|c| c.index);
         // Constitution Principle II / SC-003: at most one row group's encoded bytes
         // may be resident at a time. Drop the previous row group's chunks BEFORE
         // we fetch the next batch so the new RecordBatch + WIP encode buffers do
         // not coexist with the old encoded bytes.
         *cache = None;
+        tracing::debug!(
+            target: "virtual_parquet::reader",
+            rg_idx,
+            col_idx,
+            evicted,
+            "row-group cache miss; fetching + encoding",
+        );
         let chunks = encode_row_group(rg_idx, layout, adapter)?;
         *cache = Some(RowGroupCache {
             index: rg_idx,
